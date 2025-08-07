@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -108,7 +110,14 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 		videoThumbnails[videoID] = thumb
 	*/
-	fileName := videoIDString + `.` + extension
+	randomBytes := make([]byte, 32)
+	_, err = rand.Read(randomBytes)
+	if err != nil {
+		fmt.Println("Error generating random bytes:", err)
+		return
+	}
+
+	fileName := base64.RawURLEncoding.EncodeToString(randomBytes) + `.` + extension
 	newFilepath := filepath.Join(cfg.assetsRoot, fileName)
 
 	nFile, err := os.Create(newFilepath)
