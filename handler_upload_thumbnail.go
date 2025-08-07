@@ -1,7 +1,10 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -28,10 +31,73 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	// TODO: implement the upload here
+	const maxMemory = 10 << 20 // 10MB
+	r.ParseMultipartForm(maxMemory)
 
-	respondWithJSON(w, http.StatusOK, struct{}{})
+	// "thumbnail" should match the HTML form input name
+	file, header, err := r.FormFile("thumbnail")
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest,
+			"Missing 'thumbnail' form field", err)
+		return
+	}
+	defer file.Close()
+
+	mediaType := header.Header.Get("Content-Type")
+	if mediaType == "" {
+		respondWithError(w, http.StatusBadRequest,
+			"Content-Type header not provided", nil)
+		return
+	}
+
+	rawData, err := io.ReadAll(io.LimitReader(file, maxMemory+1))
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest,
+			"Failed to read file data", err)
+		return
+	}
+	if int64(len(rawData)) > maxMemory {
+		respondWithError(w, http.StatusRequestEntityTooLarge,
+			"File exceeds maximum size of 10 MiB", nil)
+		return
+	}
+
+	videoGot, err := cfg.db.GetVideo(videoID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound,
+				"Video not found", err)
+		} else {
+			respondWithError(w, http.StatusInternalServerError,
+				"Database error while fetching video", err)
+		}
+		return
+	}
+
+	if videoGot.UserID != userID {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized", err)
+		return
+	}
+
+	thumb := thumbnail{
+		data:      rawData,
+		mediaType: mediaType,
+	}
+
+	videoThumbnails[videoID] = thumb
+
+	thumbnailStr := fmt.Sprintf(
+		"http://localhost:%s/api/thumbnails/%s", cfg.port, videoIDString)
+	videoGot.ThumbnailURL = &thumbnailStr
+
+	err = cfg.db.UpdateVideo(videoGot)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError,
+			"Failed to update video record", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, videoGot)
 }
