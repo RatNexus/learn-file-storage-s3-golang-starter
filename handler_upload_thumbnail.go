@@ -2,11 +2,14 @@ package main
 
 import (
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -53,6 +56,21 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	mediaType, _, err = mime.ParseMediaType(mediaType)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest,
+			"Content-Type error", err)
+		return
+	}
+
+	if !(mediaType == "image/jpeg" || mediaType == "image/png") {
+		respondWithError(w, http.StatusBadRequest,
+			"Illegal Content-Type", err)
+		return
+	}
+
+	extension := strings.Split(mediaType, "/")[1]
+
 	rawData, err := io.ReadAll(io.LimitReader(file, maxMemory+1))
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest,
@@ -90,19 +108,23 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 		videoThumbnails[videoID] = thumb
 	*/
+	fileName := videoIDString + `.` + extension
+	newFilepath := filepath.Join(cfg.assetsRoot, fileName)
 
-	// Original
-	/*
-		thumbnailStr := fmt.Sprintf(
-			"http://localhost:%s/api/thumbnails/%s", cfg.port, videoIDString)
-		videoGot.ThumbnailURL = &thumbnailStr
-	*/
-	// Changed
-	enc := base64.StdEncoding.EncodeToString(rawData)
+	nFile, err := os.Create(newFilepath)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest,
+			"Failed to create file", err)
+		return
+	}
+	nFile.Write(rawData)
+	defer nFile.Close()
+
 	thumbnailStr := fmt.Sprintf(
-		"data:%s;base64,%s", mediaType, enc)
+		"http://localhost:%s/%s", cfg.port, newFilepath)
 	videoGot.ThumbnailURL = &thumbnailStr
 
+	fmt.Println(thumbnailStr)
 	err = cfg.db.UpdateVideo(videoGot)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError,
