@@ -1,22 +1,72 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+type Resolution struct {
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Aspect string `json:"display_aspect_ratio"`
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	newFilePath := filePath + ".processing"
+	fmt.Println("OLD: ", filePath)
+	fmt.Println("NEW: ", newFilePath)
+
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", newFilePath)
+	out := bytes.Buffer{}
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	return newFilePath, nil
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	out := bytes.Buffer{}
+	cmd.Stdout = &out
+	cmd.Run()
+
+	var data struct {
+		Streams []Resolution `json:"streams"`
+	}
+
+	err := json.Unmarshal(out.Bytes(), &data)
+	if err != nil {
+		return "", err
+	}
+	aspect := data.Streams[0].Aspect
+
+	fmt.Printf("Aspect: %s\n", aspect)
+
+	if aspect != "16:9" && aspect != "9:16" {
+		return "other", nil
+	}
+
+	return aspect, nil
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
@@ -103,11 +153,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
+	tempTempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error creating temp file", err)
 		return
 	}
+
+	tempFileName, err := processVideoForFastStart(tempTempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error fast processing vid", err)
+		return
+	}
+
+	os.Remove(tempTempFile.Name())
+	tempTempFile.Close()
+
+	tempFile, err := os.Open(tempFileName)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error creating fast vid file", err)
+		return
+	}
+
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
@@ -125,22 +191,41 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	randomBytes := make([]byte, 32)
 	_, err = rand.Read(randomBytes)
 	if err != nil {
-		fmt.Println("Error generating random bytes:", err)
+		respondWithError(w, http.StatusInternalServerError, "Error generating random bytes:", err)
 		return
 	}
 
 	fileName := base64.RawURLEncoding.EncodeToString(randomBytes) + `.` + extension
 
-	cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+	prefix := "other"
+	aspect, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error geting aspect ratio", err)
+		return
+	}
+
+	if aspect == "16:9" {
+		prefix = "landscape"
+	} else if aspect == "9:16" {
+		prefix = "portrait"
+	}
+
+	fileName = fmt.Sprintf("%s/%s", prefix, fileName)
+
+	s3VidPath := fmt.Sprintf(
+		"https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileName)
+	videoGot.VideoURL = &s3VidPath
+
+	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &fileName,
 		Body:        tempFile,
 		ContentType: &mediaType,
 	})
-
-	s3VidPath := fmt.Sprintf(
-		"https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileName)
-	videoGot.VideoURL = &s3VidPath
+	if err != nil {
+		fmt.Println("Error on PutObject:", err)
+		return
+	}
 
 	fmt.Println(s3VidPath)
 	err = cfg.db.UpdateVideo(videoGot)
@@ -152,3 +237,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	respondWithJSON(w, http.StatusOK, videoGot)
 }
+
+// TODO: Check if not removing the file/ closing / we will help
+// after stop of removal try using the ffmpeg command again
+// ffmpeg -i "boots.mp4" -c copy -movflags faststart -f mp4 "poots.mp4.temp"
